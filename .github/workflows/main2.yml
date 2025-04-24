@@ -37,8 +37,8 @@ jobs:
         env:
           URL: ${{ secrets.URL }}
           SCKEY: ${{ secrets.SCKEY }}
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWD: ${{ secrets.PASSWD }}
+          EMAIL: ${{ secrets.EMAIL2 }}
+          PASSWD: ${{ secrets.PASSWD2 }}
           CONFIG: ${{ secrets.CONFIG2 }}
         run: |
           python3 ./main.py
