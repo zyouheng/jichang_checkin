@@ -281,7 +281,7 @@ def sender_matches(message):
 
 def code_from_message(imap, msg_id, not_before, require_sender=True):
     """读取单封邮件并提取验证码，忽略发送时间过旧或发件人不符的邮件。"""
-    typ, data = imap.fetch(msg_id, '(BODY.PEEK[])')
+    typ, data = imap.uid('FETCH', msg_id, '(BODY.PEEK[])')
     if typ != 'OK' or not data or not isinstance(data[0], tuple):
         return None
     message = email.message_from_bytes(data[0][1])
@@ -315,22 +315,60 @@ def junk_folders(imap):
     return names
 
 
-def scan_folder(imap, folder, since, checked, not_before, require_sender):
-    """在指定邮件目录里查找本次登录的验证码。"""
+def scan_folder(imap, folder, since, checked, not_before, require_sender,
+                min_uid=0, skip_codes=None):
+    """在指定邮件目录里查找本次登录的验证码。
+
+    min_uid 之前的邮件属于上一轮登录，直接跳过，避免读到旧验证码。
+    """
+    skip_codes = skip_codes or set()
     typ, _ = imap.select(folder, readonly=True)
     if typ != 'OK':
         return None
-    typ, data = imap.search(None, 'SINCE', since)
-    msg_ids = data[0].split() if data and data[0] else []
-    for msg_id in reversed(msg_ids[-40:]):
-        key = (folder, msg_id, require_sender)
+    typ, data = imap.uid('SEARCH', None, 'SINCE', since)
+    uids = data[0].split() if data and data[0] else []
+    for uid in reversed(uids[-40:]):
+        if min_uid and int(uid) <= min_uid:
+            continue
+        key = (folder, uid, require_sender)
         if key in checked:
             continue
         checked.add(key)
-        code = code_from_message(imap, msg_id, not_before, require_sender)
-        if code:
+        code = code_from_message(imap, uid, not_before, require_sender)
+        if code and code not in skip_codes:
             return code
     return None
+
+
+def mailbox_baseline(user):
+    """记录各邮件目录当前的最大 UID，用于区分本轮新邮件与上一轮遗留邮件。"""
+    if not MAIL_AUTHCODE:
+        return {}
+    host = IMAP_HOST or guess_imap_host(user)
+    baseline = {}
+    imap = None
+    try:
+        imap = open_mailbox(host, user, MAIL_AUTHCODE)
+        folders = [IMAP_FOLDER]
+        for folder in junk_folders(imap):
+            if folder not in folders:
+                folders.append(folder)
+        for folder in folders:
+            typ, _ = imap.select(folder, readonly=True)
+            if typ != 'OK':
+                continue
+            typ, data = imap.uid('SEARCH', None, 'ALL')
+            uids = data[0].split() if data and data[0] else []
+            baseline[folder] = max(int(u) for u in uids) if uids else 0
+    except Exception as ex:
+        print('读取邮箱基线失败（不影响使用）: {}'.format(ex))
+    finally:
+        if imap is not None:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+    return baseline
 
 
 def open_mailbox(host, user, authcode):
@@ -347,12 +385,18 @@ def open_mailbox(host, user, authcode):
     return imap
 
 
-def fetch_email_code(mailbox, not_before):
-    """轮询邮箱，读取本次登录的 8 位邮箱验证码。"""
+def fetch_email_code(mailbox, not_before, baseline=None, skip_codes=None):
+    """轮询邮箱，读取本次登录的 8 位邮箱验证码。
+
+    baseline：各目录在本轮登录前的最大 UID，比它小的邮件一律不算；
+    skip_codes：已经提交过且被站点拒绝的验证码，不再重复提交。
+    """
     if not MAIL_AUTHCODE:
         print('站点要求邮箱验证码，但未配置 MAIL_AUTHCODE（邮箱授权码/应用密码）')
         return None
 
+    baseline = baseline or {}
+    skip_codes = skip_codes or set()
     user = MAIL_USER or mailbox
     host = IMAP_HOST or guess_imap_host(user)
     deadline = time.time() + EMAIL_CODE_TIMEOUT
@@ -378,7 +422,8 @@ def fetch_email_code(mailbox, not_before):
                 # 先只认本站发件人；过了等待窗口仍没收到，再放宽到全部邮件
                 require_sender = (time.time() - not_before) < MAIL_SENDER_RELAX_SECONDS
                 for folder in folders:
-                    code = scan_folder(imap, folder, since, checked, not_before, require_sender)
+                    code = scan_folder(imap, folder, since, checked, not_before, require_sender,
+                                       int(baseline.get(folder, 0)), skip_codes)
                     if code:
                         print('已读取到邮箱验证码')
                         return code
@@ -506,9 +551,12 @@ def login(session, header, user, pwd):
     if captcha is None:
         return False, '验证码求解失败，跳过此账号'
 
+    # 先记下邮箱当前状态，之后只认本轮新增的邮件，避免读到上一轮的验证码
+    baseline = mailbox_baseline(MAIL_USER or user)
     response = post_login(session, header, build_login_data(user, pwd, captcha, page_loaded_at))
     code_tries = 0
     resend_tries = 0
+    tried_codes = set()
     while not login_succeeded(response):
         if response.get('phase') == 'reverse_email_verify':
             print('改用反向邮箱验证：用邮箱给站点发信...')
@@ -538,7 +586,7 @@ def login(session, header, user, pwd):
             continue
         if code_tries >= MAX_EMAIL_CODE_TRIES:
             break
-        code = fetch_email_code(user, started_at)
+        code = fetch_email_code(user, started_at, baseline, tried_codes)
         if not code:
             print('邮箱里没等到验证码，尝试反向邮箱验证...')
             verified = reverse_email_verify(session, header, user)
@@ -547,11 +595,14 @@ def login(session, header, user, pwd):
             response = verified
             continue
         code_tries += 1
+        tried_codes.add(code)
         response = post_login(session, header, {
             'host': urlparse(url).netloc,
             'phase': 'email_code',
             'email_code': code,
         })
+        if response.get('result') == 'invalid_code':
+            print('站点判定这个验证码不对（可能是上一轮的旧邮件），继续等新邮件...')
 
     if login_succeeded(response):
         return True, response.get('msg', '登录成功')
