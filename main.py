@@ -3,6 +3,7 @@ import imaplib
 import json
 import os
 import re
+import smtplib
 import time
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
@@ -10,6 +11,7 @@ from urllib.parse import urlparse
 
 import requests
 from geeked import Geeked
+import geeked.sign as geeked_sign
 
 # 机场的地址
 url = os.environ.get('URL')
@@ -38,6 +40,18 @@ check_url = '{}/user/checkin'.format(url)
 
 MAX_RETRIES = 3
 MAX_EMAIL_CODE_TRIES = 2
+# 验证码：站点现在只下发需要交互识别的类型，用本地 word 求解器 + 反复换图重试
+MAX_CAPTCHA_LOADS = int(os.environ.get('MAX_CAPTCHA_LOADS') or '20')
+MAX_CAPTCHA_SOLVES = int(os.environ.get('MAX_CAPTCHA_SOLVES') or '5')
+CAPTCHA_ATTEMPT_INTERVAL = float(os.environ.get('CAPTCHA_ATTEMPT_INTERVAL') or '2')
+# 站点发不出验证码邮件时，请它重发的次数与间隔
+MAX_EMAIL_RESENDS = int(os.environ.get('MAX_EMAIL_RESENDS') or '3')
+EMAIL_RESEND_INTERVAL = float(os.environ.get('EMAIL_RESEND_INTERVAL') or '10')
+# 反向邮箱验证（站点发不出验证码邮件时，用邮箱给站点发信）所需的 SMTP
+SMTP_HOST = os.environ.get('SMTP_HOST') or ''
+SMTP_PORT = int(os.environ.get('SMTP_PORT') or '465')
+REVERSE_VERIFY_CHECKS = int(os.environ.get('REVERSE_VERIFY_CHECKS') or '30')
+REVERSE_VERIFY_INTERVAL = float(os.environ.get('REVERSE_VERIFY_INTERVAL') or '3')
 
 # 常见邮箱的 IMAP 服务器，用于自动识别
 IMAP_SERVERS = {
@@ -60,6 +74,27 @@ IMAP_SERVERS = {
     'aliyun.com': 'imap.aliyun.com',
 }
 
+# 常见邮箱的 SMTP 服务器（反向邮箱验证时用账号邮箱给站点发信）
+SMTP_SERVERS = {
+    'qq.com': 'smtp.qq.com',
+    'vip.qq.com': 'smtp.qq.com',
+    'foxmail.com': 'smtp.qq.com',
+    '163.com': 'smtp.163.com',
+    '126.com': 'smtp.126.com',
+    'yeah.net': 'smtp.yeah.net',
+    'gmail.com': 'smtp.gmail.com',
+    'googlemail.com': 'smtp.gmail.com',
+    'outlook.com': 'smtp.office365.com',
+    'hotmail.com': 'smtp.office365.com',
+    'live.com': 'smtp.office365.com',
+    'yahoo.com': 'smtp.mail.yahoo.com',
+    'icloud.com': 'smtp.mail.me.com',
+    'sina.com': 'smtp.sina.com',
+    'sohu.com': 'smtp.sohu.com',
+    '139.com': 'smtp.139.com',
+    'aliyun.com': 'smtp.aliyun.com',
+}
+
 EMAIL_CODE_PATTERN = re.compile(r'(?<!\d)(\d{8})(?!\d)')
 EMAIL_CODE_KEYWORDS = ('验证码', 'verification code', 'login code', 'code')
 
@@ -68,6 +103,12 @@ def guess_imap_host(mailbox):
     """根据邮箱域名猜测 IMAP 服务器地址。"""
     domain = mailbox.rsplit('@', 1)[-1].lower()
     return IMAP_SERVERS.get(domain, 'imap.{}'.format(domain))
+
+
+def guess_smtp_host(mailbox):
+    """根据邮箱域名猜测 SMTP 服务器地址。"""
+    domain = mailbox.rsplit('@', 1)[-1].lower()
+    return SMTP_SERVERS.get(domain, 'smtp.{}'.format(domain))
 
 
 def build_login_data(user, pwd, captcha, page_loaded_at):
@@ -93,22 +134,57 @@ def login_succeeded(response):
     )
 
 
+class WordClickSolver:
+    """把本地 word 求解器的坐标接到 geeked 的「点击类」载荷分支上。
+
+    geeked 根据 risk_type 决定 w 载荷的结构，点击类走的是 icon 分支，
+    所以这里把它内部的 IconSolver 换成我们自己的实现。
+    """
+
+    def __init__(self, imgs, ques):
+        self.imgs = imgs
+        self.ques = list(ques or [])
+
+    def find_icon_position(self):
+        import gt4_word
+        return gt4_word.solve_from_urls(self.imgs, self.ques)
+
+
 def solve_captcha():
-    """使用 GeekedTest 求解 GeeTest V4 验证码（纯 Python，无需浏览器），支持重试"""
-    for attempt in range(1, MAX_RETRIES + 1):
+    """反复取验证码，拿到 word 类型就本地求解，失败就换一张重试。"""
+    try:
+        import gt4_word  # noqa: F401
+    except Exception as ex:
+        print('本地求解器不可用（{}），回退无感模式'.format(ex))
+        return Geeked(CAPTCHA_ID, 'ai').solve()
+
+    geeked_sign.IconSolver = WordClickSolver
+    loads = 0
+    solves = 0
+    while loads < MAX_CAPTCHA_LOADS and solves < MAX_CAPTCHA_SOLVES:
+        loads += 1
         try:
-            print(f'验证码求解尝试 {attempt}/{MAX_RETRIES}...')
-            geeked = Geeked(CAPTCHA_ID, 'ai')
-            result = geeked.solve()
-            print('验证码求解成功')
-            return result
+            client = Geeked(CAPTCHA_ID, 'icon')
+            data = client.load_captcha()
         except Exception as ex:
-            print(f'验证码求解失败 (尝试 {attempt}/{MAX_RETRIES}): {ex}')
-            if attempt < MAX_RETRIES:
-                wait = 2
-                print(f'等待 {wait} 秒后重试...')
-                time.sleep(wait)
-    print('所有重试均失败')
+            print('第 {} 张验证码获取失败: {}'.format(loads, ex))
+            time.sleep(CAPTCHA_ATTEMPT_INTERVAL)
+            continue
+        captcha_type = data.get('captcha_type')
+        if captcha_type != 'word':
+            print('第 {} 张是 {} 类型，换一张...'.format(loads, captcha_type))
+            time.sleep(CAPTCHA_ATTEMPT_INTERVAL)
+            continue
+        solves += 1
+        client.lot_number = data['lot_number']
+        try:
+            seccode = client.submit_captcha(data)
+            print('验证码通过（第 {} 张，第 {} 次求解）'.format(loads, solves))
+            return seccode
+        except Exception as ex:
+            print('第 {} 次求解未通过: {}'.format(solves, str(ex)[:160]))
+            time.sleep(CAPTCHA_ATTEMPT_INTERVAL)
+    print('验证码求解失败（共取 {} 张，尝试求解 {} 次）'.format(loads, solves))
     return None
 
 
@@ -322,6 +398,85 @@ def post_login(session, header, data):
         return {'msg': '登录接口返回了非 JSON 内容: {}'.format(response.text[:200])}
 
 
+def send_mail(sender, recipient, subject, body):
+    """用账号邮箱给站点发信（反向邮箱验证）。"""
+    from email.mime.text import MIMEText
+
+    message = MIMEText(body, 'plain', 'utf-8')
+    message['Subject'] = subject
+    message['From'] = sender
+    message['To'] = recipient
+    host = SMTP_HOST or guess_smtp_host(sender)
+    if SMTP_PORT == 465:
+        server = smtplib.SMTP_SSL(host, SMTP_PORT, timeout=30)
+    else:
+        server = smtplib.SMTP(host, SMTP_PORT, timeout=30)
+        server.starttls()
+    try:
+        server.login(sender, MAIL_AUTHCODE)
+        server.send_message(message)
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+
+
+def reverse_email_verify(session, header, user):
+    """站点发不出验证码邮件时的备用验证方式。
+
+    站点先给一个 verify_id 和收件地址，要求用账号邮箱给该地址发一封
+    标题和内容都是 verify_id 的邮件；站点收到后即完成验证。
+    """
+    if not MAIL_AUTHCODE:
+        print('未配置 MAIL_AUTHCODE，无法使用反向邮箱验证')
+        return None
+    sender = MAIL_USER or user
+    host = urlparse(url).netloc
+    response = post_login(session, header, {
+        'host': host,
+        'phase': 'reverse_email_verify',
+        'reverse_email_verify_action': 'start',
+    })
+    if response.get('result') != 'reverse_email_verify_started':
+        print('反向邮箱验证未能开始: {}'.format(response.get('msg', response)))
+        return None
+    verify_id = response.get('verify_id')
+    recipient = response.get('recipient')
+    if not verify_id or not recipient:
+        print('反向邮箱验证缺少 verify_id / recipient')
+        return None
+    print('向 {} 发送验证邮件（标题与内容为验证串）...'.format(recipient))
+    try:
+        send_mail(sender, recipient, verify_id, verify_id)
+        print('验证邮件已发送')
+    except Exception as ex:
+        print('验证邮件发送失败: {}'.format(ex))
+        return None
+    for attempt in range(1, REVERSE_VERIFY_CHECKS + 1):
+        time.sleep(REVERSE_VERIFY_INTERVAL)
+        response = post_login(session, header, {
+            'host': host,
+            'phase': 'reverse_email_verify',
+            'reverse_email_verify_action': 'check',
+            'reverse_email_verify_id': verify_id,
+        })
+        result = response.get('result')
+        if result == 'reverse_email_verify_verified':
+            print('站点已收到验证邮件（第 {} 次检查）'.format(attempt))
+            return post_login(session, header, {
+                'host': host,
+                'phase': 'reverse_email_verify',
+                'reverse_email_verify_action': 'finish',
+                'reverse_email_verify_id': verify_id,
+            })
+        if result not in ('reverse_email_verify_pending', None):
+            print('反向邮箱验证异常: {}'.format(response.get('msg', response)))
+            return None
+    print('反向邮箱验证超时（{} 次检查）'.format(REVERSE_VERIFY_CHECKS))
+    return None
+
+
 def login(session, header, user, pwd):
     """完成分阶段登录，返回 (是否成功, 提示信息)。"""
     # 先访问登录页，建立与浏览器一致的会话，并记录页面加载时间。
@@ -336,14 +491,46 @@ def login(session, header, user, pwd):
         return False, '验证码求解失败，跳过此账号'
 
     response = post_login(session, header, build_login_data(user, pwd, captcha, page_loaded_at))
-    for _ in range(MAX_EMAIL_CODE_TRIES):
-        if login_succeeded(response):
-            return True, response.get('msg', '登录成功')
+    code_tries = 0
+    resend_tries = 0
+    while not login_succeeded(response):
+        if response.get('phase') == 'reverse_email_verify':
+            print('改用反向邮箱验证：用邮箱给站点发信...')
+            verified = reverse_email_verify(session, header, user)
+            if verified is None:
+                return False, '反向邮箱验证未通过'
+            response = verified
+            continue
         if response.get('phase') != 'email_code':
+            break
+        # 站点没把邮件发出去（code_sent=false）时，请它重发，而不是干等邮箱
+        if response.get('code_sent') is False or response.get('result') == 'email_send_failed':
+            if resend_tries >= MAX_EMAIL_RESENDS:
+                print('站点始终未能发出验证码邮件，尝试反向邮箱验证...')
+                verified = reverse_email_verify(session, header, user)
+                if verified is None:
+                    return False, '站点发不出邮箱验证码，反向邮箱验证也未通过'
+                response = verified
+                continue
+            resend_tries += 1
+            print('站点未能发出验证码邮件，请求重发（第 {} 次）...'.format(resend_tries))
+            time.sleep(EMAIL_RESEND_INTERVAL)
+            response = post_login(session, header, {
+                'host': urlparse(url).netloc,
+                'phase': 'email_resend',
+            })
+            continue
+        if code_tries >= MAX_EMAIL_CODE_TRIES:
             break
         code = fetch_email_code(user, started_at)
         if not code:
-            return False, '站点要求登录邮箱验证码，未能自动读取到验证码'
+            print('邮箱里没等到验证码，尝试反向邮箱验证...')
+            verified = reverse_email_verify(session, header, user)
+            if verified is None:
+                return False, '站点要求登录邮箱验证码，未能自动读取到验证码'
+            response = verified
+            continue
+        code_tries += 1
         response = post_login(session, header, {
             'host': urlparse(url).netloc,
             'phase': 'email_code',

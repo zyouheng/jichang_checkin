@@ -2,3 +2,5 @@ requests>=2.23.0
 curl_cffi>=0.10.0
 typing_extensions>=4.8.0; python_version < "3.11"
 pycryptodome>=3.20.0
+# 本地求解 GeeTest v4 交互验证码（word 类型）：RapidOCR = PaddleOCR 的 ONNX 版
+rapidocr-onnxruntime>=1.3.0
