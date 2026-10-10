@@ -171,6 +171,18 @@ def solve_captcha():
             time.sleep(CAPTCHA_ATTEMPT_INTERVAL)
             continue
         captcha_type = data.get('captcha_type')
+        # 万一站点改回无感验证（不下发 icon/nine/word 等交互类型），
+        # 仍按原来的无感方式提交这一张，不必等重试耗尽
+        if captcha_type in (None, 'ai', 'invisible'):
+            client.risk_type = 'ai'
+            try:
+                seccode = client.submit_captcha(data)
+                print('无感验证通过（第 {} 张）'.format(loads))
+                return seccode
+            except Exception as ex:
+                print('第 {} 张无感提交未通过: {}'.format(loads, str(ex)[:160]))
+                time.sleep(CAPTCHA_ATTEMPT_INTERVAL)
+                continue
         if captcha_type != 'word':
             print('第 {} 张是 {} 类型，换一张...'.format(loads, captcha_type))
             time.sleep(CAPTCHA_ATTEMPT_INTERVAL)
