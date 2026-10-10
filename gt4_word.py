@@ -144,29 +144,43 @@ def region_candidates(maps, glyph, shape, region, topk=8, scale_step=0.15, angle
     return sorted(pool.values(), key=lambda item: -item['score'])[:topk]
 
 
-def solve_from_bytes(main_raw, prompt_raws, verbose=False):
-    """返回 [[x, y], ...]，坐标已归一化到 0~10000，顺序与题目一致。"""
-    img = decode_image(main_raw)
-    if img is None:
-        raise ValueError('主图解码失败')
-    height, width = img.shape[:2]
-    maps = foreground_maps(img)
-
+def _text_regions(img, raw):
+    """用 RapidOCR 找出主图里的文字区域（只有 word 类型用得上）。"""
     ok, buf = cv2.imencode('.jpg', img)
-    result, _ = engine()(buf.tobytes() if ok else main_raw)
+    result, _ = engine()(buf.tobytes() if ok else raw)
     regions = []
     for box, text, score in (result or []):
         pts = np.array(box, dtype=np.int32)
         regions.append({'rect': (int(pts[:, 0].min()), int(pts[:, 1].min()),
                                  int(pts[:, 0].max()), int(pts[:, 1].max())),
                         'text': text, 'score': float(score)})
+    return regions
+
+
+def solve_from_bytes(main_raw, prompt_raws, verbose=False, mode='word'):
+    """返回 [[x, y], ...]，坐标已归一化到 0~10000，顺序与题目一致。
+
+    mode='word'：主图是散落的中文字，用 RapidOCR 定位文字区域并按文字约束搜索；
+    mode='icon'：主图是彩噪背景上的线框图标，没有文字，直接全图搜索。
+    """
+    img = decode_image(main_raw)
+    if img is None:
+        raise ValueError('主图解码失败')
+    height, width = img.shape[:2]
+    maps = foreground_maps(img)
+
+    if mode == 'icon':
+        regions = [{'rect': (0, 0, width, height), 'text': '', 'score': 1.0}]
+    else:
+        regions = _text_regions(img, main_raw)
 
     targets = []
     for raw in prompt_raws:
         glyph = prompt_glyph(raw)
         if glyph is None:
             raise ValueError('题目图解码失败')
-        targets.append({'text': prompt_text(raw), 'glyph': glyph, 'candidates': []})
+        text = '' if mode == 'icon' else prompt_text(raw)
+        targets.append({'text': text, 'glyph': glyph, 'candidates': []})
 
     for target in targets:
         candidates = []
@@ -210,10 +224,10 @@ def solve_from_bytes(main_raw, prompt_raws, verbose=False):
     return points
 
 
-def solve_from_urls(imgs, ques, timeout=30, verbose=False):
+def solve_from_urls(imgs, ques, timeout=30, verbose=False, mode='word'):
     """imgs / ques 是 GeeTest 返回的相对路径。"""
     main_raw = download(STATIC_BASE + imgs, timeout)
     prompt_raws = [download(STATIC_BASE + path, timeout) for path in (ques or [])]
     if not prompt_raws:
         raise ValueError('题目为空')
-    return solve_from_bytes(main_raw, prompt_raws, verbose=verbose)
+    return solve_from_bytes(main_raw, prompt_raws, verbose=verbose, mode=mode)

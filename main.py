@@ -134,12 +134,15 @@ def login_succeeded(response):
     )
 
 
-class WordClickSolver:
-    """把本地 word 求解器的坐标接到 geeked 的「点击类」载荷分支上。
+class ClickSolver:
+    """把本地求解器的坐标接到 geeked 的「点击类」载荷分支上。
 
     geeked 根据 risk_type 决定 w 载荷的结构，点击类走的是 icon 分支，
     所以这里把它内部的 IconSolver 换成我们自己的实现。
+    mode 由 solve_captcha 按实际下发的类型设置（word / icon）。
     """
+
+    mode = 'word'
 
     def __init__(self, imgs, ques):
         self.imgs = imgs
@@ -147,18 +150,18 @@ class WordClickSolver:
 
     def find_icon_position(self):
         import gt4_word
-        return gt4_word.solve_from_urls(self.imgs, self.ques)
+        return gt4_word.solve_from_urls(self.imgs, self.ques, mode=ClickSolver.mode)
 
 
 def solve_captcha():
-    """反复取验证码，拿到 word 类型就本地求解，失败就换一张重试。"""
+    """反复取验证码，拿到 word/icon 类型就本地求解，失败就换一张重试。"""
     try:
         import gt4_word  # noqa: F401
     except Exception as ex:
         print('本地求解器不可用（{}），回退无感模式'.format(ex))
         return Geeked(CAPTCHA_ID, 'ai').solve()
 
-    geeked_sign.IconSolver = WordClickSolver
+    geeked_sign.IconSolver = ClickSolver
     loads = 0
     solves = 0
     while loads < MAX_CAPTCHA_LOADS and solves < MAX_CAPTCHA_SOLVES:
@@ -183,15 +186,16 @@ def solve_captcha():
                 print('第 {} 张无感提交未通过: {}'.format(loads, str(ex)[:160]))
                 time.sleep(CAPTCHA_ATTEMPT_INTERVAL)
                 continue
-        if captcha_type != 'word':
+        if captcha_type not in ('word', 'icon'):
             print('第 {} 张是 {} 类型，换一张...'.format(loads, captcha_type))
             time.sleep(CAPTCHA_ATTEMPT_INTERVAL)
             continue
         solves += 1
+        ClickSolver.mode = captcha_type
         client.lot_number = data['lot_number']
         try:
             seccode = client.submit_captcha(data)
-            print('验证码通过（第 {} 张，第 {} 次求解）'.format(loads, solves))
+            print('验证码通过（第 {} 张，{} 类型，第 {} 次求解）'.format(loads, captcha_type, solves))
             return seccode
         except Exception as ex:
             print('第 {} 次求解未通过: {}'.format(solves, str(ex)[:160]))
